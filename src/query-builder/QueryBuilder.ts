@@ -50,6 +50,15 @@ import { escapeRegExp } from "../util/escapeRegExp"
 const WRITE_QUERY_TYPES = ["update", "delete", "soft-delete", "restore"]
 
 /**
+ * Delimiters wrapping the placeholders used to mask string literals while
+ * entity property names are replaced. They contain no characters that the
+ * identifier-replacement regex treats as token boundaries, so a masked literal
+ * is always left untouched by that replacement.
+ */
+const STRING_LITERAL_MASK_PREFIX = "@__typeorm_masked_literal_"
+const STRING_LITERAL_MASK_SUFFIX = "__@"
+
+/**
  * Allows to build complex sql queries in a fashion way and execute those queries.
  */
 export abstract class QueryBuilder<Entity extends ObjectLiteral> {
@@ -794,6 +803,13 @@ export abstract class QueryBuilder<Entity extends ObjectLiteral> {
             .map((key) => escapeRegExp(key))
             .join("|")
 
+        // Mask single-quoted string literals so that identifier replacement can
+        // never rewrite a column/keyword token that happens to appear inside a
+        // string (e.g. a column named "delete", or `'this id will delete.'`).
+        const { statement: maskedStatement, literals } =
+            this.maskStringLiterals(statement)
+        statement = maskedStatement
+
         if (replacementKeys.length > 0) {
             statement = statement.replaceAll(
                 new RegExp(
@@ -835,7 +851,60 @@ export abstract class QueryBuilder<Entity extends ObjectLiteral> {
             )
         }
 
-        return statement
+        return this.unmaskStringLiterals(statement, literals)
+    }
+
+    /**
+     * Replaces every single-quoted string literal in the statement with a
+     * numbered placeholder, returning the masked statement and the extracted
+     * literals. SQL escapes an embedded single quote by doubling it (''), which
+     * the pattern accounts for. Line (`--`) and block comments are matched as
+     * well and left untouched, so an apostrophe inside a comment is not mistaken
+     * for the start of a literal.
+     *
+     * @param statement
+     */
+    private maskStringLiterals(statement: string): {
+        statement: string
+        literals: string[]
+    } {
+        const literals: string[] = []
+        const masked = statement.replaceAll(
+            /--[^\n]*|\/\*[\s\S]*?\*\/|'(?:[^']|'')*'/g,
+            (match) => {
+                // Only string literals are masked; a comment is returned as-is.
+                if (!match.startsWith("'")) {
+                    return match
+                }
+                literals.push(match)
+                return `${STRING_LITERAL_MASK_PREFIX}${
+                    literals.length - 1
+                }${STRING_LITERAL_MASK_SUFFIX}`
+            },
+        )
+        return { statement: masked, literals }
+    }
+
+    /**
+     * Restores the string literals previously extracted by maskStringLiterals.
+     *
+     * @param statement
+     * @param literals
+     */
+    private unmaskStringLiterals(
+        statement: string,
+        literals: string[],
+    ): string {
+        if (literals.length === 0) return statement
+        return statement.replaceAll(
+            new RegExp(
+                `${escapeRegExp(
+                    STRING_LITERAL_MASK_PREFIX,
+                )}(\\d+)${escapeRegExp(STRING_LITERAL_MASK_SUFFIX)}`,
+                "g",
+            ),
+            (_, index) => literals[+index],
+        )
     }
 
     protected createComment(): string {
